@@ -14,7 +14,7 @@ import time
 from collections import defaultdict, namedtuple
 from copy import deepcopy
 from patroni.exceptions import PatroniException
-from patroni.utils import parse_bool
+from patroni.utils import parse_bool, uri
 from random import randint
 from six.moves.urllib_parse import urlparse, urlunparse, parse_qsl
 from threading import Event, Lock
@@ -134,10 +134,7 @@ class Member(namedtuple('Member', 'index,name,session,data')):
             return conn_url
 
         if conn_kwargs:
-            conn_url = 'postgresql://{host}:{port}'.format(
-                host=conn_kwargs.get('host'),
-                port=conn_kwargs.get('port', 5432),
-            )
+            conn_url = uri('postgresql', (conn_kwargs.get('host'), conn_kwargs.get('port', 5432)))
             self.data['conn_url'] = conn_url
             return conn_url
 
@@ -160,11 +157,11 @@ class Member(namedtuple('Member', 'index,name,session,data')):
             }
             self.data['conn_kwargs'] = ret.copy()
 
+        # apply any remaining authentication parameters
         if auth and isinstance(auth, dict):
+            ret.update(auth)
             if 'username' in auth:
-                ret['user'] = auth['username']
-            if 'password' in auth:
-                ret['password'] = auth['password']
+                ret['user'] = ret.pop('username')
         return ret
 
     @property
@@ -247,7 +244,8 @@ class Leader(namedtuple('Leader', 'index,session,member')):
         version = self.member.data.get('version')
         if version:
             try:
-                if tuple(map(int, version.split('.'))) >= (1, 5, 6):
+                # 1.5.6 is the last version which doesn't expose checkpoint_after_promote: false
+                if tuple(map(int, version.split('.'))) > (1, 5, 6):
                     return self.member.data['role'] == 'master' and 'checkpoint_after_promote' not in self.member.data
             except Exception:
                 logger.debug('Failed to parse Patroni version %s', version)
@@ -444,14 +442,16 @@ class Cluster(namedtuple('Cluster', 'initialize,config,leader,last_leader_operat
         # the current master, because that member would replicate from elsewhere. We still create the slot if
         # the replicatefrom destination member is currently not a member of the cluster (fallback to the
         # master), or if replicatefrom destination member happens to be the current master
+        use_slots = self.config and self.config.data.get('postgresql', {}).get('use_slots', True)
         if role in ('master', 'standby_leader'):
-            slot_members = [m.name for m in self.members if m.name != name and
+            slot_members = [m.name for m in self.members if use_slots and m.name != name and
                             (m.replicatefrom is None or m.replicatefrom == name or
                              not self.has_member(m.replicatefrom))]
             permanent_slots = (self.config and self.config.permanent_slots or {}).copy()
         else:
             # only manage slots for replicas that replicate from this one, except for the leader among them
-            slot_members = [m.name for m in self.members if m.replicatefrom == name and m.name != self.leader.name]
+            slot_members = [m.name for m in self.members if use_slots and
+                            m.replicatefrom == name and m.name != self.leader.name]
             permanent_slots = {}
 
         slots = {slot_name_from_member_name(name): {'type': 'physical'} for name in slot_members}

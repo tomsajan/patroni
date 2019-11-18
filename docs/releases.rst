@@ -3,6 +3,246 @@
 Release notes
 =============
 
+Version 1.6.1
+
+**New features**
+
+- Added ``PATRONICTL_CONFIG_FILE`` environment variable (msvechla)
+
+  It allows configuring the ``--config-file`` argument for ``patronictl`` from the environment.
+
+- Implement ``patronictl history`` (Alexander Kukushkin)
+
+  It shows the history of failovers/switchovers.
+
+- Pass ``-c statement_timeout=0`` in ``PGOPTIONS`` when doing ``pg_rewind`` (Alexander Kukushkin)
+
+  It protects from the case when ``statement_timeout`` on the server is set to some small value and one of the statements executed by pg_rewind is canceled.
+
+- Allow lower values for PostgreSQL configuration (Soulou)
+
+  Patroni didn't allow some of the PostgreSQL configuration parameters be set smaller than some hardcoded values. Now the minimal allowed values are smaller, default values have not been changed.
+
+- Allow for certificate-based authentication (Jonathan S. Katz)
+
+  This feature enables certificate-based authentication for superuser, replication, rewind accounts and allows the user to specify the ``sslmode`` they wish to connect with.
+
+- Use the ``passfile`` in the ``primary_conninfo`` instead of password (Alexander Kukushkin)
+
+  It allows to avoid setting ``600`` permissions on postgresql.conf
+
+- Perform ``pg_ctl reload`` regardless of config changes (Alexander Kukushkin)
+
+  It is possible that some config files are not controlled by Patroni. When somebody is doing a reload via the REST API or by sending SIGHUP to the Patroni process, the usual expectation is that Postgres will also be reloaded. Previously it didn't happen when there were no changes in the ``postgresql`` section of Patroni config.
+
+- Compare all recovery parameters, not only ``primary_conninfo`` (Alexander Kukushkin)
+
+  Previously the ``check_recovery_conf()`` method was only checking whether ``primary_conninfo`` has changed, never taking into account all other recovery parameters.
+
+- Make it possible to apply some recovery parameters without restart (Alexander Kukushkin)
+
+  Starting from PostgreSQL 12 the following recovery parameters could be changed without restart: ``archive_cleanup_command``, ``promote_trigger_file``, ``recovery_end_command``, and ``recovery_min_apply_delay``. In future Postgres releases this list will be extended and Patroni will support it automatically.
+
+- Make it possible to change ``use_slots`` online (Alexander Kukushkin)
+
+  Previously it required restarting Patroni and removing slots manually.
+
+- Remove only ``PATRONI_`` prefixed environment variables when starting up Postgres (Cody Coons)
+
+  It will solve a lot of problems with running different Foreign Data Wrappers.
+
+
+**Stability improvements**
+
+- Use LIST + WATCH when working with K8s API (Alexander Kukushkin)
+
+  It allows to efficiently receive object changes (pods, endpoints/configmaps) and makes less stress on K8s master nodes.
+
+- Improve the workflow when PGDATA is not empty during bootstrap (Alexander Kukushkin)
+
+  According to the ``initdb`` source code it might consider a PGDATA empty when there are only ``lost+found`` and ``.dotfiles`` in it. Now Patroni does the same. If ``PGDATA`` happens to be non-empty, and at the same time not valid from the ``pg_controldata`` point of view, Patroni will complain and exit.
+
+- Avoid calling expensive ``os.listdir()`` on every HA loop (Alexander Kukushkin)
+
+  When the system is under IO stress, ``os.listdir()`` could take a few seconds (or even minutes) to execute, badly affecting the HA loop of Patroni. This could even cause the leader key to disappear from DCS due to the lack of updates. There is a better and less expensive way to check that the PGDATA is not empty. Now we check the presence of the ``global/pg_control`` file in the PGDATA.
+
+- Some improvements in logging infrastructure (Alexander Kukushkin)
+
+  Previously threre was a possibility to loose the last few log lines on shutdown because the logging thread was a ``daemon`` thread.
+
+- Use ``spawn`` multiprocessing start method on python 3.4+ (Maciej Kowalczyk)
+
+  It is a known `issue <https://bugs.python.org/issue6721>`__ in Python that threading and multiprocessing do not mix well. Switching from the default method ``fork`` to the ``spawn`` is a recommended workaround. Not doing so might result in the Postmaster starting process hanging and Patroni indefinitely reporting ``INFO: restarting after failure in progress``, while  Postgres is actually up and running.
+
+**Improvements in REST API**
+
+- Make it possible to check client certificates in the REST API (Alexander Kukushkin)
+
+  If the ``verify_client`` is set to ``required``, Patroni will check client certificates for all REST API calls. When it is set to ``optional``, client certificates are checked for all unsafe REST API endpoints.
+
+- Return the response code 503 for the ``GET /replica`` health check request if Postgres is not running (Alexander Anikin)
+
+  Postgres might spend significant time in recovery before it starts accepting client connections.
+
+- Implement ``/history`` and ``/cluster`` endpoints (Alexander Kukushkin)
+
+  The ``/history`` endpoint shows the content of the ``history`` key in DCS. The ``/cluster`` endpoint shows all cluster members and some service info like pending and scheduled restarts or switchovers.
+
+
+**Improvements in Etcd support**
+
+- Retry on Etcd RAFT internal error (Alexander Kukushkin)
+
+  When the Etcd node is being shut down, it sends ``response code=300, data='etcdserver: server stopped'``, which was causing Patroni to demote the primary.
+
+- Don't give up on Etcd request retry too early (Alexander Kukushkin)
+
+  When there were some network problems, Patroni was quickly exhausting the list of Etcd nodes and giving up without using the whole ``retry_timeout``, potentially resulting in demoting the primary.
+
+
+**Bugfixes**
+
+- Disable ``synchronous_commit`` when granting execute permissions to the ``pg_rewind`` user (kremius)
+
+  If the bootstrap is done with ``synchronous_mode_strict: true`` the `GRANT EXECUTE` statement was waiting indefinitely due to the non-synchronous nodes being available.
+
+- Fix memory leak on python 3.7 (Alexander Kukushkin)
+
+  Patroni is using ``ThreadingMixIn`` to process REST API requests and python 3.7 made threads spawn for every request non-daemon by default.
+
+- Fix race conditions in asynchronous actions (Alexander Kukushkin)
+
+  There was a chance that ``patronictl reinit --force`` could be overwritten by the attempt to recover stopped Postgres. This ended up in a situation when Patroni was trying to start Postgres while basebackup was running.
+
+- Fix race condition in ``postmaster_start_time()`` method (Alexander Kukushkin)
+
+  If the method is executed from the REST API thread, it requires a separate cursor object to be created.
+
+- Fix the problem of not promoting the sync standby that had a name contaning upper case letters (Alexander Kukushkin)
+
+  We converted the name to the lower case because Postgres was doing the same while comparing the ``application_name`` with the value in ``synchronous_standby_names``.
+
+- Kill all children along with the callback process before starting the new one (Alexander Kukushkin)
+
+  Not doing so makes it hard to implement callbacks in bash and eventually can lead to the situation when two callbacks are running at the same time. 
+
+- Fix 'start failed' issue (Alexander Kukushkin)
+
+  Under certain conditions the Postgres state might be set to 'start failed' despite Postgres being up and running.
+
+
+Version 1.6.0
+-------------
+
+This version adds compatibility with PostgreSQL 12, makes is possible to run pg_rewind without superuser on PostgreSQL 11 and newer, and enables IPv6 support.
+
+
+**New features**
+
+- Psycopg2 was removed from requirements and must be installed independently (Alexander Kukushkin)
+
+  Starting from 2.8.0 ``psycopg2`` was split into two different packages, ``psycopg2``, and ``psycopg2-binary``, which could be installed at the same time into the same place on the filesystem. In order to decrease dependency hell problem, we let a user choose how to install it. There are a few options available, please consult the :ref:`documentation <psycopg2_install_options>`.
+
+- Compatibility with PostgreSQL 12 (Alexander Kukushkin)
+
+  Starting from PostgreSQL 12 there is no ``recovery.conf`` anymore and all former recovery parameters are converted into `GUC <https://www.enterprisedb.com/blog/what-is-a-guc-variable>`_. In order to protect from ``ALTER SYSTEM SET primary_conninfo`` or similar, Patroni will parse ``postgresql.auto.conf`` and remove all standby and recovery parameters from there. Patroni config remains backward compatible. For example despite ``restore_command`` being a GUC, one can still specify it in the ``postgresql.recovery_conf.restore_command`` section and Patroni will write it into ``postgresql.conf`` for PostgreSQL 12.
+
+- Make it possible to use ``pg_rewind`` without superuser on PostgreSQL 11 and newer (Alexander Kukushkin)
+
+  If you want to use this feature please define ``username`` and ``password`` in the ``postgresql.authentication.rewind`` section of Patroni configuration file. For an already existing cluster you will have to create the user manually and ``GRANT EXECUTE`` permission on a few functions. You can find more details in the PostgreSQL `documentation <https://www.postgresql.org/docs/11/app-pgrewind.html#id-1.9.5.8.8>`__.
+
+- Do a smart comparison of actual and desired ``primary_conninfo`` values on replicas (Alexander Kukushkin)
+
+  It might help to avoid replica restart when you are converting an already existing primary-standby cluster to one managed by Patroni
+
+- IPv6 support (Alexander Kukushkin)
+
+  There were two major issues. Patroni REST API service was listening only on ``0.0.0.0`` and IPv6 IP addresses used in the ``api_url`` and ``conn_url`` were not properly quoted.
+
+- Kerberos support (Ajith Vilas, Alexander Kukushkin)
+
+  It makes possible using Kerberos authentication between Postgres nodes instead of defining passwords in Patroni configuration file
+
+- Manage ``pg_ident.conf`` (Alexander Kukushkin)
+
+  This functionality works similarly to ``pg_hba.conf``: if the ``postgresql.pg_ident`` is defined in the config file or DCS, Patroni will write its value to ``pg_ident.conf``, however, if ``postgresql.parameters.ident_file`` is defined, Patroni will assume that ``pg_ident`` is managed from outside and not update the file.
+
+
+**Improvements in REST API**
+
+- Added ``/health`` endpoint (Wilfried Roset)
+
+  It will return an HTTP status code only if PostgreSQL is running
+
+- Added ``/read-only`` and ``/read-write`` endpoints (Julien Riou)
+
+  The ``/read-only`` endpoint enables reads balanced across replicas and the primary. The ``/read-write`` endpoint is an alias for ``/primary``, ``/leader`` and ``/master``.
+
+- Use ``SSLContext`` to wrap the REST API socket (Julien Riou)
+
+  Usage of ``ssl.wrap_socket()`` is deprecated and was still allowing soon-to-be-deprecated protocols like TLS 1.1.
+
+
+**Logging improvements**
+
+- Two-step logging (Alexander Kukushkin)
+
+  All log messages are first written into the in-memory queue and later they are asynchronously flushed into the stderr or file from a separate thread. The maximum queue size is limited (configurable). If the limit is reached, Patroni will start losing logs, which is still better than blocking the HA loop.
+
+- Enable debug logging for GET/OPTIONS API calls together with latency (Jan Tomsa)
+
+  It will help with debugging of health-checks performed by HAProxy, Consul or other tooling that decides which node is the primary/replica.
+
+- Log exceptions caught in Retry (Daniel Kucera)
+
+  Log the final exception when either the number of attempts or the timeout were reached. It will hopefully help to debug some issues when communication to DCS fails.
+
+
+**Improvements in patronictl**
+
+- Enhance dialogues for scheduled switchover and restart (Rafia Sabih)
+
+  Previously dialogues did not take into account scheduled actions and therefore were misleading.
+
+- Check if config file exists (Wilfried Roset)
+
+  Be verbose about configuration file when the given filename does not exists, instead of ignoring silently (which can lead to misunderstanding).
+
+- Add fallback value for ``EDITOR`` (Wilfried Roset)
+
+  When the ``EDITOR`` environment variable was not defined, ``patronictl edit-config`` was failing with `PatroniCtlException`. The new strategy is to try ``editor`` and than ``vi``, which should be available on most systems.
+
+
+**Improvements in Consul support**
+
+- Allow to specify Consul consistency mode (Jan Tomsa)
+
+  You can read more about consistency mode `here <https://www.consul.io/api/features/consistency.html>`__.
+
+- Reload Consul config on SIGHUP (Cameron Daniel, Alexander Kukushkin)
+
+  It is especially useful when somebody is changing the value of ``token``.
+
+
+**Bugfixes**
+
+- Fix corner case in switchover/failover (Sharoon Thomas)
+
+  The variable ``scheduled_at`` may be undefined if REST API is not accessible and we are using DCS as a fallback.
+
+- Open trust to localhost in ``pg_hba.conf`` during custom bootstrap (Alexander Kukushkin)
+
+  Previously it was open only to unix_socket, which was causing a lot of errors: ``FATAL:  no pg_hba.conf entry for replication connection from host "127.0.0.1", user "replicator"``
+
+- Consider synchronous node as healthy even when the former leader is ahead (Alexander Kukushkin)
+
+  If the primary loses access to the DCS, it restarts Postgres in read-only, but it might happen that other nodes can still access the old primary via the REST API. Such a situation was causing the synchronous standby not to promote because the old primary was reporting WAL position ahead of the synchronous standby.
+
+- Standby cluster bugfixes (Alexander Kukushkin)
+
+  Make it possible to bootstrap a replica in a standby cluster when the standby_leader is not accessible and a few other minor fixes.
+
+
 Version 1.5.6
 -------------
 

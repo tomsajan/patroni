@@ -16,6 +16,7 @@ class Patroni(object):
         from patroni.ha import Ha
         from patroni.log import PatroniLogger
         from patroni.postgresql import Postgresql
+        from patroni.request import PatroniRequest
         from patroni.version import __version__
         from patroni.watchdog import Watchdog
 
@@ -31,6 +32,7 @@ class Patroni(object):
 
         self.postgresql = Postgresql(self.config['postgresql'])
         self.api = RestApiServer(self, self.config['restapi'])
+        self.request = PatroniRequest(self.config, True)
         self.ha = Ha(self)
 
         self.tags = self.get_tags()
@@ -66,14 +68,16 @@ class Patroni(object):
     def nosync(self):
         return bool(self.tags.get('nosync', False))
 
-    def reload_config(self):
+    def reload_config(self, sighup=False):
         try:
             self.tags = self.get_tags()
             self.logger.reload_config(self.config.get('log', {}))
-            self.dcs.reload_config(self.config)
             self.watchdog.reload_config(self.config)
+            if sighup:
+                self.request.reload_config(self.config)
             self.api.reload_config(self.config['restapi'])
-            self.postgresql.reload_config(self.config['postgresql'])
+            self.postgresql.reload_config(self.config['postgresql'], sighup)
+            self.dcs.reload_config(self.config)
         except Exception:
             logger.exception('Failed to reload config_file=%s', self.config.config_file)
 
@@ -114,13 +118,16 @@ class Patroni(object):
 
     def run(self):
         self.api.start()
+        self.logger.start()
         self.next_run = time.time()
 
         while not self.received_sigterm:
             if self._received_sighup:
                 self._received_sighup = False
                 if self.config.reload_local_configuration():
-                    self.reload_config()
+                    self.reload_config(True)
+                else:
+                    self.postgresql.config.reload_config(self.config['postgresql'], True)
 
             logger.info(self.ha.run_cycle())
 
@@ -169,6 +176,13 @@ def fatal(string, *args):
     sys.exit(1)
 
 
+def use_spawn_start_method():
+    if sys.version_info >= (3, 4):
+        # The default, forking, method is not a good idea in a multithreaded process: https://bugs.python.org/issue6721
+        import multiprocessing
+        multiprocessing.set_start_method('spawn')
+
+
 def check_psycopg2():
     min_psycopg2 = (2, 5, 4)
     min_psycopg2_str = '.'.join(map(str, min_psycopg2))
@@ -191,6 +205,7 @@ def check_psycopg2():
 
 
 def main():
+    use_spawn_start_method()
     check_psycopg2()
     if os.getpid() != 1:
         return patroni_main()
